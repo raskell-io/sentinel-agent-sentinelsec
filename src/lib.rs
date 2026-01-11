@@ -630,4 +630,134 @@ mod tests {
         assert!(engine.is_excluded("/metrics"));
         assert!(!engine.is_excluded("/api/users"));
     }
+
+    #[test]
+    fn test_sql_injection_blocked() {
+        // Create a ModSecurity engine with a SQL injection detection rule
+        let rules = r#"
+            SecRuleEngine On
+            SecRule ARGS "@detectSQLi" "id:942100,phase:2,deny,status:403,msg:'SQL Injection Attack Detected'"
+            SecRule QUERY_STRING "@detectSQLi" "id:942101,phase:1,deny,status:403,msg:'SQL Injection in Query String'"
+            SecRule REQUEST_URI "@contains union select" "id:942102,phase:1,deny,status:403,msg:'UNION SELECT detected'"
+        "#;
+
+        let modsec = sentinel_modsec::ModSecurity::from_string(rules).unwrap();
+
+        // Test 1: Classic SQL injection in query string
+        let mut tx = modsec.new_transaction();
+        tx.process_uri("/api/users?id=1' OR '1'='1", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+
+        let intervention = tx.intervention();
+        assert!(
+            intervention.is_some(),
+            "Expected SQL injection to be blocked: 1' OR '1'='1"
+        );
+        if let Some(i) = intervention {
+            assert_eq!(i.status, 403);
+            println!("Blocked with status {}: {:?}", i.status, i.rule_ids);
+        }
+
+        // Test 2: UNION-based SQL injection
+        let mut tx2 = modsec.new_transaction();
+        tx2.process_uri("/api/users?id=1 union select * from users--", "GET", "HTTP/1.1").unwrap();
+        tx2.process_request_headers().unwrap();
+
+        let intervention2 = tx2.intervention();
+        assert!(
+            intervention2.is_some(),
+            "Expected UNION SELECT injection to be blocked"
+        );
+
+        // Test 3: Clean request should pass
+        let mut tx3 = modsec.new_transaction();
+        tx3.process_uri("/api/users?id=123", "GET", "HTTP/1.1").unwrap();
+        tx3.process_request_headers().unwrap();
+
+        assert!(
+            tx3.intervention().is_none(),
+            "Clean request should not be blocked"
+        );
+    }
+
+    #[test]
+    fn test_xss_blocked() {
+        // Create a ModSecurity engine with XSS detection rule
+        let rules = r#"
+            SecRuleEngine On
+            SecRule ARGS "@detectXSS" "id:941100,phase:2,deny,status:403,msg:'XSS Attack Detected'"
+            SecRule QUERY_STRING "@detectXSS" "id:941101,phase:1,deny,status:403,msg:'XSS in Query String'"
+            SecRule REQUEST_URI "@contains <script" "id:941102,phase:1,deny,status:403,msg:'Script tag detected'"
+        "#;
+
+        let modsec = sentinel_modsec::ModSecurity::from_string(rules).unwrap();
+
+        // Test 1: Script tag injection
+        let mut tx = modsec.new_transaction();
+        tx.process_uri("/search?q=<script>alert(1)</script>", "GET", "HTTP/1.1").unwrap();
+        tx.process_request_headers().unwrap();
+
+        let intervention = tx.intervention();
+        assert!(
+            intervention.is_some(),
+            "Expected XSS to be blocked: <script>alert(1)</script>"
+        );
+        if let Some(i) = intervention {
+            assert_eq!(i.status, 403);
+            println!("XSS blocked with status {}: {:?}", i.status, i.rule_ids);
+        }
+
+        // Test 2: Event handler injection
+        let mut tx2 = modsec.new_transaction();
+        tx2.process_uri("/search?q=<img src=x onerror=alert(1)>", "GET", "HTTP/1.1").unwrap();
+        tx2.process_request_headers().unwrap();
+
+        let intervention2 = tx2.intervention();
+        assert!(
+            intervention2.is_some(),
+            "Expected event handler XSS to be blocked"
+        );
+
+        // Test 3: Clean request should pass
+        let mut tx3 = modsec.new_transaction();
+        tx3.process_uri("/search?q=hello+world", "GET", "HTTP/1.1").unwrap();
+        tx3.process_request_headers().unwrap();
+
+        assert!(
+            tx3.intervention().is_none(),
+            "Clean request should not be blocked"
+        );
+    }
+
+    #[test]
+    fn test_request_body_sql_injection() {
+        // Test SQL injection in POST body
+        let rules = r#"
+            SecRuleEngine On
+            SecRequestBodyAccess On
+            SecRule ARGS "@detectSQLi" "id:942200,phase:2,deny,status:403,msg:'SQL Injection in Body'"
+        "#;
+
+        let modsec = sentinel_modsec::ModSecurity::from_string(rules).unwrap();
+
+        let mut tx = modsec.new_transaction();
+        tx.process_uri("/api/login", "POST", "HTTP/1.1").unwrap();
+        tx.add_request_header("Content-Type", "application/x-www-form-urlencoded").unwrap();
+        tx.process_request_headers().unwrap();
+
+        // Add malicious body
+        let body = b"username=admin&password=' OR '1'='1";
+        tx.append_request_body(body).unwrap();
+        tx.process_request_body().unwrap();
+
+        let intervention = tx.intervention();
+        assert!(
+            intervention.is_some(),
+            "Expected SQL injection in POST body to be blocked"
+        );
+        if let Some(i) = intervention {
+            assert_eq!(i.status, 403);
+            println!("Body SQLi blocked: {:?}", i.rule_ids);
+        }
+    }
 }
