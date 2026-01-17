@@ -1,27 +1,24 @@
 //! Sentinel SentinelSec Agent CLI
 //!
 //! Command-line interface for the pure Rust ModSecurity-compatible WAF agent.
+//! Uses gRPC transport with Agent Protocol v2 for communication with Sentinel proxy.
 
 use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
 use tracing::info;
 
 use sentinel_agent_sentinelsec::{SentinelSecAgent, SentinelSecConfig};
-use sentinel_agent_protocol::AgentServer;
+use sentinel_agent_protocol::v2::GrpcAgentServerV2;
 
 /// Command line arguments
 #[derive(Parser, Debug)]
 #[command(name = "sentinel-sentinelsec-agent")]
 #[command(about = "Pure Rust ModSecurity-compatible WAF agent for Sentinel - full OWASP CRS support without C dependencies")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Args {
-    /// Path to Unix socket
-    #[arg(
-        long,
-        default_value = "/tmp/sentinel-sentinelsec.sock",
-        env = "AGENT_SOCKET"
-    )]
-    socket: PathBuf,
+    /// gRPC server address (default: "0.0.0.0:50051")
+    #[arg(long, default_value = "0.0.0.0:50051", env = "AGENT_GRPC_ADDRESS")]
+    grpc_address: String,
 
     /// Paths to ModSecurity rule files (can be specified multiple times, supports glob patterns)
     #[arg(long = "rules", env = "SENTINELSEC_RULES", value_delimiter = ',')]
@@ -87,7 +84,11 @@ async fn main() -> Result<()> {
         .json()
         .init();
 
-    info!("Starting Sentinel SentinelSec Agent (pure Rust ModSecurity)");
+    info!(
+        version = env!("CARGO_PKG_VERSION"),
+        protocol = "v2",
+        "Starting Sentinel SentinelSec Agent (pure Rust ModSecurity)"
+    );
 
     // Build configuration
     let config = args.to_config();
@@ -111,10 +112,20 @@ async fn main() -> Result<()> {
     // Create agent
     let agent = SentinelSecAgent::new(config)?;
 
-    // Start agent server
-    info!(socket = ?args.socket, "Starting agent server");
-    let server = AgentServer::new("sentinel-sentinelsec-agent", args.socket, Box::new(agent));
-    server.run().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+    // Start agent server using gRPC transport (v2 protocol)
+    let addr: std::net::SocketAddr = args.grpc_address
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid gRPC address '{}': {}", args.grpc_address, e))?;
+
+    info!(
+        address = %addr,
+        transport = "grpc",
+        protocol = "v2",
+        "Starting gRPC agent server"
+    );
+
+    let server = GrpcAgentServerV2::new("sentinel-sentinelsec", Box::new(agent));
+    server.run(addr).await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
     Ok(())
 }

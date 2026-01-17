@@ -7,15 +7,15 @@
 //!
 //! ```ignore
 //! use sentinel_agent_sentinelsec::{SentinelSecAgent, SentinelSecConfig};
-//! use sentinel_agent_protocol::AgentServer;
+//! use sentinel_agent_protocol::v2::GrpcAgentServerV2;
 //!
 //! let config = SentinelSecConfig {
 //!     rules_paths: vec!["/etc/modsecurity/crs/rules/*.conf".to_string()],
 //!     ..Default::default()
 //! };
 //! let agent = SentinelSecAgent::new(config)?;
-//! let server = AgentServer::new("sentinelsec", "/tmp/sentinelsec.sock", Box::new(agent));
-//! server.run().await?;
+//! let server = GrpcAgentServerV2::new("sentinelsec", Box::new(agent));
+//! server.run("0.0.0.0:50051".parse().unwrap()).await?;
 //! ```
 
 use anyhow::Result;
@@ -23,13 +23,18 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use sentinel_agent_protocol::{
-    AgentHandler, AgentResponse, AuditMetadata, ConfigureEvent, HeaderOp, RequestBodyChunkEvent,
+    AgentResponse, AuditMetadata, EventType, HeaderOp, RequestBodyChunkEvent,
     RequestHeadersEvent, ResponseBodyChunkEvent, ResponseHeadersEvent,
+};
+use sentinel_agent_protocol::v2::{
+    AgentCapabilities, AgentFeatures, AgentHandlerV2, AgentLimits, DrainReason,
+    HealthStatus, MetricsReport, ShutdownReason,
 };
 
 use sentinel_modsec::ModSecurity;
@@ -214,6 +219,12 @@ struct PendingTransaction {
 pub struct SentinelSecAgent {
     engine: Arc<RwLock<SentinelSecEngine>>,
     pending_requests: Arc<RwLock<HashMap<String, PendingTransaction>>>,
+    /// Metrics tracking
+    requests_total: AtomicU64,
+    requests_blocked: AtomicU64,
+    requests_allowed: AtomicU64,
+    /// Draining state
+    draining: AtomicU64, // 0 = not draining, >0 = drain end timestamp ms
 }
 
 impl SentinelSecAgent {
@@ -223,7 +234,24 @@ impl SentinelSecAgent {
         Ok(Self {
             engine: Arc::new(RwLock::new(engine)),
             pending_requests: Arc::new(RwLock::new(HashMap::new())),
+            requests_total: AtomicU64::new(0),
+            requests_blocked: AtomicU64::new(0),
+            requests_allowed: AtomicU64::new(0),
+            draining: AtomicU64::new(0),
         })
+    }
+
+    /// Check if the agent is currently draining
+    fn is_draining(&self) -> bool {
+        let drain_end = self.draining.load(Ordering::Relaxed);
+        if drain_end == 0 {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        now < drain_end
     }
 
     /// Reconfigure the agent with new settings
@@ -315,17 +343,48 @@ impl SentinelSecAgent {
 }
 
 #[async_trait::async_trait]
-impl AgentHandler for SentinelSecAgent {
-    async fn on_configure(&self, event: ConfigureEvent) -> AgentResponse {
-        debug!(agent_id = %event.agent_id, "Received configure event");
+impl AgentHandlerV2 for SentinelSecAgent {
+    /// Return agent capabilities for v2 protocol negotiation
+    fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities::new(
+            "sentinel-sentinelsec",
+            "SentinelSec WAF Agent",
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_event(EventType::RequestHeaders)
+        .with_event(EventType::RequestBodyChunk)
+        .with_event(EventType::ResponseHeaders)
+        .with_event(EventType::ResponseBodyChunk)
+        .with_features(AgentFeatures {
+            streaming_body: true,
+            websocket: false,
+            guardrails: false,
+            config_push: true,
+            metrics_export: true,
+            concurrent_requests: 100,
+            cancellation: true,
+            flow_control: false,
+            health_reporting: true,
+        })
+        .with_limits(AgentLimits {
+            max_body_size: 10 * 1024 * 1024, // 10MB
+            max_concurrency: 100,
+            preferred_chunk_size: 64 * 1024, // 64KB
+            max_memory: None,
+            max_processing_time_ms: Some(5000),
+        })
+    }
+
+    /// Handle configuration updates from the proxy
+    async fn on_configure(&self, config: serde_json::Value, version: Option<String>) -> bool {
+        debug!(config_version = ?version, "Received configure event");
 
         // Parse the JSON config into SentinelSecConfigJson
-        let config_json: SentinelSecConfigJson = match serde_json::from_value(event.config) {
+        let config_json: SentinelSecConfigJson = match serde_json::from_value(config) {
             Ok(config) => config,
             Err(e) => {
                 warn!(error = %e, "Failed to parse SentinelSec configuration");
-                // Return allow but log the error - agent can still work with existing config
-                return AgentResponse::default_allow();
+                return false;
             }
         };
 
@@ -333,15 +392,99 @@ impl AgentHandler for SentinelSecAgent {
         let config: SentinelSecConfig = config_json.into();
         if let Err(e) = self.reconfigure(config).await {
             warn!(error = %e, "Failed to reconfigure SentinelSec engine");
-            // Return allow but log the error
-            return AgentResponse::default_allow();
+            return false;
         }
 
-        info!(agent_id = %event.agent_id, "SentinelSec agent configured successfully");
-        AgentResponse::default_allow()
+        info!(config_version = ?version, "SentinelSec agent configured successfully");
+        true
+    }
+
+    /// Return current health status
+    fn health_status(&self) -> HealthStatus {
+        if self.is_draining() {
+            let drain_end = self.draining.load(Ordering::Relaxed);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let eta_ms = if drain_end > now { Some(drain_end - now) } else { None };
+            HealthStatus {
+                agent_id: "sentinel-sentinelsec".to_string(),
+                state: sentinel_agent_protocol::v2::HealthState::Draining { eta_ms },
+                message: Some("Agent is draining".to_string()),
+                load: None,
+                resources: None,
+                valid_until_ms: None,
+                timestamp_ms: now,
+            }
+        } else {
+            HealthStatus::healthy("sentinel-sentinelsec")
+        }
+    }
+
+    /// Return metrics report for v2 protocol
+    fn metrics_report(&self) -> Option<MetricsReport> {
+        use sentinel_agent_protocol::v2::{CounterMetric, GaugeMetric};
+
+        let mut report = MetricsReport::new("sentinel-sentinelsec", 10_000);
+
+        report.counters.push(CounterMetric::new(
+            "sentinelsec_requests_total",
+            self.requests_total.load(Ordering::Relaxed),
+        ));
+        report.counters.push(CounterMetric::new(
+            "sentinelsec_requests_blocked",
+            self.requests_blocked.load(Ordering::Relaxed),
+        ));
+        report.counters.push(CounterMetric::new(
+            "sentinelsec_requests_allowed",
+            self.requests_allowed.load(Ordering::Relaxed),
+        ));
+
+        // Add gauge for pending requests
+        let pending_count = {
+            // Use try_read to avoid blocking if lock is held
+            self.pending_requests
+                .try_read()
+                .map(|p| p.len() as f64)
+                .unwrap_or(0.0)
+        };
+        report.gauges.push(GaugeMetric::new(
+            "sentinelsec_pending_requests",
+            pending_count,
+        ));
+
+        Some(report)
+    }
+
+    /// Handle shutdown request
+    async fn on_shutdown(&self, reason: ShutdownReason, grace_period_ms: u64) {
+        info!(
+            reason = ?reason,
+            grace_period_ms = grace_period_ms,
+            "Received shutdown request"
+        );
+        // Clear pending requests on shutdown
+        let mut pending = self.pending_requests.write().await;
+        pending.clear();
+    }
+
+    /// Handle drain request
+    async fn on_drain(&self, duration_ms: u64, reason: DrainReason) {
+        info!(
+            duration_ms = duration_ms,
+            reason = ?reason,
+            "Received drain request"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.draining.store(now + duration_ms, Ordering::Relaxed);
     }
 
     async fn on_request_headers(&self, event: RequestHeadersEvent) -> AgentResponse {
+        self.requests_total.fetch_add(1, Ordering::Relaxed);
         let path = &event.uri;
         let correlation_id = &event.metadata.correlation_id;
 
@@ -369,6 +512,7 @@ impl AgentHandler for SentinelSecAgent {
             Ok(Some((status, message, rule_ids))) => {
                 let engine = self.engine.read().await;
                 if engine.config.block_mode {
+                    self.requests_blocked.fetch_add(1, Ordering::Relaxed);
                     info!(
                         correlation_id = correlation_id,
                         status = status,
@@ -396,6 +540,7 @@ impl AgentHandler for SentinelSecAgent {
                             ..Default::default()
                         })
                 } else {
+                    self.requests_allowed.fetch_add(1, Ordering::Relaxed);
                     info!(
                         correlation_id = correlation_id,
                         rules = ?rule_ids,
@@ -415,6 +560,7 @@ impl AgentHandler for SentinelSecAgent {
                 }
             }
             Ok(None) => {
+                self.requests_allowed.fetch_add(1, Ordering::Relaxed);
                 // Headers passed - if body inspection enabled, store for body processing
                 let engine = self.engine.read().await;
                 if engine.config.body_inspection_enabled {
@@ -433,6 +579,7 @@ impl AgentHandler for SentinelSecAgent {
                 AgentResponse::default_allow()
             }
             Err(e) => {
+                self.requests_allowed.fetch_add(1, Ordering::Relaxed);
                 warn!(error = %e, "SentinelSec processing error");
                 AgentResponse::default_allow()
             }
@@ -510,6 +657,9 @@ impl AgentHandler for SentinelSecAgent {
                     Ok(Some((status, message, rule_ids))) => {
                         let engine = self.engine.read().await;
                         if engine.config.block_mode {
+                            self.requests_blocked.fetch_add(1, Ordering::Relaxed);
+                            // Decrement allowed since we counted it in headers phase
+                            self.requests_allowed.fetch_sub(1, Ordering::Relaxed);
                             info!(
                                 correlation_id = correlation_id,
                                 status = status,
