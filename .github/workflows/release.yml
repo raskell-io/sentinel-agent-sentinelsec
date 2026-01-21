@@ -1,137 +1,152 @@
 name: Release
 
-# DISABLED: Uncomment the 'on' block below to enable releases
-# on:
-#   push:
-#     tags:
-#       - 'v*'
-
 on:
-  workflow_dispatch:  # Manual trigger only for now
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.2.0)'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/sentinel-sentinelsec
+  BINARY_NAME: sentinel-sentinelsec-agent
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
-    if: false  # Disabled - set to true to enable crates.io publishing
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish to crates.io
-        run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        continue-on-error: true
-
   build:
-    runs-on: ubuntu-latest
-    if: false  # Disabled - set to true to enable builds
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: linux-aarch64
+            cross: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: darwin-aarch64
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
-      - name: Install build dependencies
+      - name: Install cross-compilation tools
+        if: matrix.cross
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Build release binary
-        run: |
-          cargo build --release
-          strip target/release/sentinel-sentinelsec-agent
+        run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Prepare artifacts
-        run: |
-          mkdir -p artifacts
-          cp target/release/sentinel-sentinelsec-agent artifacts/
+      - name: Strip binary (Linux native)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
 
-      - name: Upload artifacts
+      - name: Strip binary (Linux cross)
+        if: matrix.cross
+        run: aarch64-linux-gnu-strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+
+      - name: Strip binary (macOS)
+        if: contains(matrix.target, 'darwin')
+        run: strip target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
+          cd dist
+          tar -czvf ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-${{ matrix.artifact }}.tar.gz ${{ env.BINARY_NAME }}
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sentinel-sentinelsec-linux-amd64
-          path: artifacts/
-          retention-days: 7
-
-  docker:
-    needs: build
-    runs-on: ubuntu-latest
-    if: false  # Disabled - set to true to enable Docker builds
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download AMD64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: sentinel-sentinelsec-linux-amd64
-          path: artifacts/linux-amd64
-
-      - name: Prepare artifact
-        run: chmod +x artifacts/linux-amd64/sentinel-sentinelsec-agent
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Build and push image
-        uses: docker/build-push-action@v5
-        with:
-          context: artifacts/linux-amd64
-          file: ./Dockerfile
-          target: prebuilt
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          provenance: false
+          name: ${{ matrix.artifact }}
+          path: dist/*.tar.gz
+          retention-days: 1
 
   release:
-    needs: [build, docker]
+    name: Create Release
+    needs: build
     runs-on: ubuntu-latest
-    if: false  # Disabled - set to true to enable releases
     permissions:
       contents: write
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download AMD64 artifact
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "tag=v${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: sentinel-sentinelsec-linux-amd64
-          path: artifacts/linux-amd64
+          path: artifacts
 
-      - name: Prepare release files
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Collect release files
         run: |
           mkdir -p release
-          mv artifacts/linux-amd64/sentinel-sentinelsec-agent release/sentinel-sentinelsec-agent-linux-amd64
+          find artifacts -name '*.tar.gz' -exec mv {} release/ \;
+          ls -la release/
+
+      - name: Delete existing release if exists
+        run: gh release delete "${{ steps.version.outputs.tag }}" --yes || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: v${{ steps.version.outputs.version }}
           files: release/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
