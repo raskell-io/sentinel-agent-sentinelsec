@@ -2,7 +2,7 @@
 
 A pure Rust ModSecurity-compatible WAF agent for [Sentinel](https://github.com/raskell-io/sentinel) reverse proxy. Provides full OWASP Core Rule Set (CRS) support with **zero C dependencies** - no libmodsecurity required.
 
-> **Alpha Release:** This agent is in early development. The core functionality works but expect API changes and potential bugs.
+> **Note:** CRS compatibility depends on the [sentinel-modsec](https://github.com/raskell-io/sentinel-modsec) engine, a pure Rust reimplementation of libmodsecurity. If you encounter unsupported SecLang features, please [file an issue](https://github.com/raskell-io/sentinel-agent-sentinelsec/issues).
 
 ## Features
 
@@ -20,7 +20,7 @@ A pure Rust ModSecurity-compatible WAF agent for [Sentinel](https://github.com/r
 
 | Feature | SentinelSec | ModSec | WAF |
 |---------|-------------|--------|-----|
-| Detection Rules | 800+ CRS rules | 800+ CRS rules | ~20 regex rules |
+| Detection Rules | 800+ CRS rules | 800+ CRS rules | 285 rules |
 | SecLang Support | Yes | Yes | No |
 | Custom Rules | Yes | Yes | No |
 | @detectSQLi/@detectXSS | Yes (pure Rust) | Yes (C lib) | No |
