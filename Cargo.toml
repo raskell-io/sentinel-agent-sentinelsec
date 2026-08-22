@@ -29,7 +29,7 @@ zentinel-common = "0.5"
 # Pure Rust ModSecurity implementation
 # >= 0.1.4 required: fixes the `&` count operator so stock OWASP CRS v4 evaluates
 # (earlier versions block every request). See zentinel-modsec#12.
-zentinel-modsec = "0.1.4"
+zentinel-modsec = "0.2.0"
 
 # Async runtime
 tokio = { version = "1.40", features = ["full"] }
