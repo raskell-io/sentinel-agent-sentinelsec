@@ -23,7 +23,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Zentinel protocol
-zentinel-agent-protocol = "0.5"
+zentinel-agent-protocol = "0.6"
 zentinel-common = "0.5"
 
 # Pure Rust ModSecurity implementation
