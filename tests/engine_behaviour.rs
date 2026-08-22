@@ -6,7 +6,8 @@
 //! behaviour without touching a line of this crate.
 //!
 //! These ran green across the 0.1.4 -> 0.2.0 bump, which changed chain
-//! evaluation (zentinel-modsec#18).
+//! evaluation (zentinel-modsec#18), and the 0.2.0 -> 0.3.0 bump, which added
+//! JSON body inspection (zentinel-modsec#24).
 
 use zentinel_modsec::ModSecurity;
 
@@ -58,4 +59,71 @@ fn anomaly_scoring_reaches_the_threshold() {
 
     assert!(blocked(rules, "/?q=<script>alert(1)</script>", "GET"));
     assert!(!blocked(rules, "/?q=hello", "GET"));
+}
+
+/// A body-carrying request, which the helper above does not cover.
+fn blocked_with_body(rules: &str, content_type: &str, body: &[u8]) -> bool {
+    let m = ModSecurity::from_string(rules).expect("rules should load");
+    let mut tx = m.new_transaction();
+    tx.process_uri("/api/search", "POST", "HTTP/1.1").unwrap();
+    tx.add_request_header("Host", "example.com").unwrap();
+    tx.add_request_header("Content-Type", content_type).unwrap();
+    tx.process_request_headers().unwrap();
+    tx.append_request_body(body).unwrap();
+    tx.process_request_body().unwrap();
+    tx.has_intervention()
+}
+
+const ARGS_SQLI: &str = "SecRuleEngine On\n\
+    SecRule ARGS \"@detectSQLi\" \"id:942100,phase:2,deny,status:403\"";
+
+/// The reason for the 0.3.0 bump.
+///
+/// Before zentinel-modsec#24 a JSON body fell through to the urlencoded
+/// parser, so `ARGS` was empty for every JSON request and this rule had
+/// nothing to inspect. This agent is deployed in front of APIs that are
+/// overwhelmingly JSON, so that was most of the traffic it was meant to
+/// protect.
+#[test]
+fn sqli_in_a_json_body_is_blocked() {
+    let payload = br#"{"q":"1 UNION SELECT password FROM users"}"#;
+    assert!(
+        blocked_with_body(ARGS_SQLI, "application/json", payload),
+        "SQLi in a JSON body must be detected"
+    );
+}
+
+/// The control: the same payload in a form body. If this ever fails, the test
+/// above proves nothing about JSON specifically.
+#[test]
+fn sqli_in_a_form_body_is_blocked() {
+    assert!(blocked_with_body(
+        ARGS_SQLI,
+        "application/x-www-form-urlencoded",
+        b"q=1 UNION SELECT password FROM users"
+    ));
+}
+
+#[test]
+fn sqli_nested_inside_a_json_object_is_blocked() {
+    let payload = br#"{"filter":{"where":{"name":"1 UNION SELECT password FROM users"}}}"#;
+    assert!(blocked_with_body(ARGS_SQLI, "application/json", payload));
+}
+
+/// Clean JSON must still pass. A body processor that blocked everything would
+/// satisfy the tests above and be useless in production.
+#[test]
+fn clean_json_traffic_is_not_blocked() {
+    let payload = br#"{"q":"laptop","page":2,"in_stock":true}"#;
+    assert!(!blocked_with_body(ARGS_SQLI, "application/json", payload));
+}
+
+/// An empty body with a JSON content type is routine on POST and DELETE and
+/// must not be treated as a parse failure — a CRS ruleset with rule 200002
+/// would otherwise reject those requests.
+#[test]
+fn an_empty_json_body_does_not_trip_the_body_error_rule() {
+    let crs_200002 = "SecRuleEngine On\n\
+        SecRule REQBODY_ERROR \"!@eq 0\" \"id:200002,phase:2,deny,status:400\"";
+    assert!(!blocked_with_body(crs_200002, "application/json", b""));
 }
