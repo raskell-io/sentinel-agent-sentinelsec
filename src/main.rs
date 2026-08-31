@@ -14,7 +14,7 @@ use zentinel_agent_zentinelsec::{ZentinelSecAgent, ZentinelSecConfig};
 #[derive(Parser, Debug)]
 #[command(name = "zentinel-zentinelsec-agent")]
 #[command(
-    about = "Pure Rust ModSecurity-compatible WAF agent for Zentinel - full OWASP CRS support without C dependencies"
+    about = "Pure Rust ModSecurity-compatible WAF agent for Zentinel - loads the stock OWASP CRS without C dependencies"
 )]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 struct Args {
