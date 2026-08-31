@@ -142,13 +142,25 @@ pub struct ZentinelSecEngine {
 impl ZentinelSecEngine {
     /// Create a new ZentinelSec engine with the given configuration
     pub fn new(config: ZentinelSecConfig) -> Result<Self> {
-        // Build rules string from all rule files
+        // Hand the engine `Include` directives rather than the text of each
+        // rule file.
+        //
+        // Splicing file contents together loses the one thing the engine needs
+        // to resolve `@pmFromFile`/`@ipMatchFromFile` data paths and nested
+        // `Include`s: which file a directive came from. Those paths are
+        // relative to their own rule file, so a concatenated string sent them
+        // to the process's working directory instead. Stock CRS references
+        // `scanners-user-agents.data` and many others, which meant the
+        // documented deployment only started if it happened to be run from
+        // /etc/modsecurity/crs/rules.
         let mut rules_content = String::new();
 
         // Always enable the rule engine
         rules_content.push_str("SecRuleEngine On\n");
 
-        // Load rules from configured paths
+        // Resolve the configured patterns ourselves so a path that cannot be
+        // read is reported against the pattern that produced it, and so the
+        // file count is available for logging.
         let mut loaded_count = 0;
         for path_pattern in &config.rules_paths {
             // Handle glob patterns
@@ -159,13 +171,16 @@ impl ZentinelSecEngine {
                 match entry {
                     Ok(path) => {
                         if path.is_file() {
-                            let content = fs::read_to_string(&path).map_err(|e| {
-                                anyhow::anyhow!("Failed to read rule file {:?}: {}", path, e)
+                            // An absolute path keeps the include independent of
+                            // the working directory; quoting keeps a path with
+                            // spaces in one argument.
+                            let absolute = fs::canonicalize(&path).map_err(|e| {
+                                anyhow::anyhow!("Failed to resolve rule file {:?}: {}", path, e)
                             })?;
-                            rules_content.push_str(&content);
-                            rules_content.push('\n');
+                            rules_content
+                                .push_str(&format!("Include \"{}\"\n", absolute.display()));
                             loaded_count += 1;
-                            debug!(path = ?path, "Loaded rule file");
+                            debug!(path = ?absolute, "Including rule file");
                         }
                     }
                     Err(e) => {
@@ -176,7 +191,7 @@ impl ZentinelSecEngine {
         }
 
         // Create the ModSecurity engine
-        let modsec = if rules_content.trim().is_empty() || loaded_count == 0 {
+        let modsec = if loaded_count == 0 {
             // No rules loaded, create with just SecRuleEngine On
             ModSecurity::from_string("SecRuleEngine On")
                 .map_err(|e| anyhow::anyhow!("Failed to initialize ZentinelSec engine: {}", e))?
@@ -192,6 +207,20 @@ impl ZentinelSecEngine {
         );
 
         Ok(Self { modsec, config })
+    }
+
+    /// Number of rules the engine loaded.
+    pub fn rule_count(&self) -> usize {
+        self.modsec.rule_count()
+    }
+
+    /// The underlying ModSecurity engine.
+    ///
+    /// Exposed so tests can drive transactions through the rules this agent
+    /// actually loaded, rather than through a separately built engine that
+    /// might load them differently.
+    pub fn modsec(&self) -> &ModSecurity {
+        &self.modsec
     }
 
     /// Check if path should be excluded
@@ -313,12 +342,17 @@ impl ZentinelSecAgent {
                     status = status,
                     "ZentinelSec intervention (headers)"
                 );
-                let rule_ids = tx.matched_rules().iter().map(|s| s.to_string()).collect();
-                return Ok(Some((
-                    status,
-                    "Blocked by ZentinelSec".to_string(),
-                    rule_ids,
-                )));
+                // The rules that caused the intervention, not every rule that
+                // matched: `matched_rules()` also lists CRS setup actions and
+                // chain starters whose chain never completed, so its first
+                // entry under stock CRS is a setup rule such as 900990 rather
+                // than the rule that blocked.
+                let rule_ids = intervention.rule_ids.clone();
+                let message = intervention
+                    .log
+                    .clone()
+                    .unwrap_or_else(|| "Blocked by ZentinelSec".to_string());
+                return Ok(Some((status, message, rule_ids)));
             }
         }
 
@@ -339,12 +373,12 @@ impl ZentinelSecAgent {
                             status = status,
                             "ZentinelSec intervention (body)"
                         );
-                        let rule_ids = tx.matched_rules().iter().map(|s| s.to_string()).collect();
-                        return Ok(Some((
-                            status,
-                            "Blocked by ZentinelSec".to_string(),
-                            rule_ids,
-                        )));
+                        let rule_ids = intervention.rule_ids.clone();
+                        let message = intervention
+                            .log
+                            .clone()
+                            .unwrap_or_else(|| "Blocked by ZentinelSec".to_string());
+                        return Ok(Some((status, message, rule_ids)));
                     }
                 }
             }
