@@ -1,12 +1,17 @@
 # zentinel-agent-zentinelsec
 
-A pure Rust ModSecurity-compatible WAF agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Provides full OWASP Core Rule Set (CRS) support with **zero C dependencies** - no libmodsecurity required.
+A pure Rust ModSecurity-compatible WAF agent for [Zentinel](https://github.com/zentinelproxy/zentinel) reverse proxy. Loads the OWASP Core Rule Set with **zero C dependencies** - no libmodsecurity required.
 
-> **Note:** CRS compatibility depends on the [zentinel-modsec](https://github.com/zentinelproxy/zentinel-modsec) engine, a pure Rust reimplementation of libmodsecurity. If you encounter unsupported SecLang features, please [file an issue](https://github.com/zentinelproxy/zentinel-agent-zentinelsec/issues).
+> **CRS compatibility is measured, not assumed.** Detection comes from the
+> [zentinel-modsec](https://github.com/zentinelproxy/zentinel-modsec) engine, a
+> pure Rust reimplementation of libmodsecurity, which is run against the OWASP
+> CRS regression suite on every push. See
+> [CRS conformance](#crs-conformance) for the current number and the known gaps
+> before deploying this in blocking mode.
 
 ## Features
 
-- **Full OWASP CRS Compatibility**: Parse and execute 800+ CRS rules
+- **Loads the stock OWASP CRS**: all 703 rules of CRS 4.30 parse and execute; see [CRS conformance](#crs-conformance)
 - **Pure Rust Implementation**: No libmodsecurity or C dependencies
 - **Built-in SQLi/XSS Detection**: Native `@detectSQLi` and `@detectXSS` operators
 - **SecLang Support**: Load standard ModSecurity rule files
@@ -20,7 +25,7 @@ A pure Rust ModSecurity-compatible WAF agent for [Zentinel](https://github.com/z
 
 | Feature | ZentinelSec | ModSec | WAF |
 |---------|-------------|--------|-----|
-| Detection Rules | 800+ CRS rules | 800+ CRS rules | 285 rules |
+| Detection Rules | stock CRS, [conformance measured](#crs-conformance) | stock CRS (reference implementation) | 285 rules |
 | SecLang Support | Yes | Yes | No |
 | Custom Rules | Yes | Yes | No |
 | @detectSQLi/@detectXSS | Yes (pure Rust) | Yes (C lib) | No |
@@ -28,7 +33,42 @@ A pure Rust ModSecurity-compatible WAF agent for [Zentinel](https://github.com/z
 | Binary Size | ~10MB | ~50MB | ~5MB |
 | Installation | `cargo install` | Requires libmodsecurity | `cargo install` |
 
-**ZentinelSec combines the best of both worlds**: Full CRS compatibility like ModSec, with zero-dependency installation like WAF.
+**ZentinelSec aims to combine the two**: the stock CRS rule set like ModSec, with
+zero-dependency installation like WAF. Unlike ModSec it is not the reference
+implementation of SecLang, so its CRS behaviour is
+[measured against the upstream regression suite](#crs-conformance) rather than
+taken as given.
+
+## CRS conformance
+
+Detection is provided by [zentinel-modsec](https://github.com/zentinelproxy/zentinel-modsec),
+which runs the OWASP CRS regression suite — roughly 5,000 request/expectation
+pairs naming the rule IDs that must or must not fire — on every push.
+
+| | |
+|---|---|
+| Corpus | CRS `main` (4.30.0-dev), 5,033 runnable cases |
+| Passing | **4,080 (81.1%)** |
+
+That corpus runs in `DetectionOnly` at paranoia level 4, which is how CRS
+documents it. It measures whether individual rules **match**; it does not
+measure whether the WAF **decides** correctly, because in that mode nothing
+blocks and the anomaly score never reaches rule 949110. Both properties are
+tested, separately, in that repository.
+
+### Before deploying in blocking mode
+
+`--block-mode` defaults to `true`. Check the open items below first — they
+affect what a stock CRS deployment does to real traffic:
+
+| Issue | Effect |
+|---|---|
+| [zentinel-modsec#29](https://github.com/zentinelproxy/zentinel-modsec/issues/29) | Stock CRS denies **every** request, `GET /` included, and anomaly scoring never accumulates |
+| [zentinel-modsec#34](https://github.com/zentinelproxy/zentinel-modsec/issues/34) | `+` is not decoded as a space in form-encoded arguments, so rules matching payloads containing whitespace can be evaded |
+| [zentinel-modsec#31](https://github.com/zentinelproxy/zentinel-modsec/issues/31) | `t:cmdLine` is incomplete, so Windows command-line rules (932xxx) do not match |
+
+Until #29 is fixed and released, run with `--block-mode false` and treat the
+output as detection only.
 
 ## Installation
 
