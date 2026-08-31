@@ -48,7 +48,7 @@ pairs naming the rule IDs that must or must not fire — on every push.
 | | |
 |---|---|
 | Corpus | CRS `main` (4.30.0-dev), 5,033 runnable cases |
-| Passing | **4,080 (81.1%)** |
+| Passing | **4,608 (91.6%)** |
 
 That corpus runs in `DetectionOnly` at paranoia level 4, which is how CRS
 documents it. It measures whether individual rules **match**; it does not
@@ -58,17 +58,19 @@ tested, separately, in that repository.
 
 ### Before deploying in blocking mode
 
-`--block-mode` defaults to `true`. Check the open items below first — they
-affect what a stock CRS deployment does to real traffic:
+`--block-mode` defaults to `true`. Stock CRS is tested in exactly that
+configuration — `crs_does_not_block_ordinary_traffic` and `crs_detects_attacks`
+in `tests/crs_integration.rs` assert that ordinary requests pass and attacks are
+blocked, against a real CRS checkout.
 
-| Issue | Effect |
-|---|---|
-| [zentinel-modsec#29](https://github.com/zentinelproxy/zentinel-modsec/issues/29) | Stock CRS denies **every** request, `GET /` included, and anomaly scoring never accumulates |
-| [zentinel-modsec#34](https://github.com/zentinelproxy/zentinel-modsec/issues/34) | `+` is not decoded as a space in form-encoded arguments, so rules matching payloads containing whitespace can be evaded |
-| [zentinel-modsec#31](https://github.com/zentinelproxy/zentinel-modsec/issues/31) | `t:cmdLine` is incomplete, so Windows command-line rules (932xxx) do not match |
-
-Until #29 is fixed and released, run with `--block-mode false` and treat the
-output as detection only.
+> **Upgrade if you are on 0.3.x.** Versions of `zentinel-modsec` before 0.4.0
+> deny **every** request under stock CRS, `GET /` included, because CRS 920100
+> tests an unimplemented `REQUEST_LINE` with a negated regex
+> ([zentinel-modsec#29](https://github.com/zentinelproxy/zentinel-modsec/issues/29)).
+> They also miss payloads that encode spaces as `+`, or that percent-encode the
+> `=` in a form body ([#34](https://github.com/zentinelproxy/zentinel-modsec/issues/34),
+> [#38](https://github.com/zentinelproxy/zentinel-modsec/issues/38)) — both
+> straightforward bypasses.
 
 ## Installation
 

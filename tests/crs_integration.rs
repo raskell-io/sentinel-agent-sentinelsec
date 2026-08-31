@@ -213,10 +213,6 @@ fn crs_detects_attacks_in_xml_bodies() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "fails against zentinel-modsec 0.3.0: CRS 920100 denies every request because \
-REQUEST_LINE is unimplemented and its negated regex inverts. Fixed by \
-zentinelproxy/zentinel-modsec#30; remove this attribute when the dependency is bumped past it. \
-See zentinelproxy/zentinel-modsec#29."]
 fn crs_does_not_block_ordinary_traffic() {
     // This is the test whose absence let a 100%-block-rate defect ship: with
     // stock CRS every one of these was denied by 920100, including `GET /`.
@@ -253,10 +249,6 @@ fn crs_does_not_block_ordinary_traffic() {
 }
 
 #[test]
-#[ignore = "fails against zentinel-modsec 0.3.0: CRS 920100 denies every request because \
-REQUEST_LINE is unimplemented and its negated regex inverts. Fixed by \
-zentinelproxy/zentinel-modsec#30; remove this attribute when the dependency is bumped past it. \
-See zentinelproxy/zentinel-modsec#29."]
 fn crs_does_not_block_an_ordinary_xml_post() {
     let Some(dir) = crs_dir() else { return };
     let e = engine(&dir);
