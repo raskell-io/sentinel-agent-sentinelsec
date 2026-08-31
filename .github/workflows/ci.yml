@@ -80,4 +80,11 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-test-
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      # The CRS integration tests fail loudly without this checkout rather than
+      # skipping, so that they cannot silently stop running again.
+      - name: Fetch OWASP CRS
+        run: |
+          mkdir -p test-rules
+          git clone --depth 1 https://github.com/coreruleset/coreruleset.git test-rules/crs
+          cp test-rules/crs/crs-setup.conf.example test-rules/crs/crs-setup.conf
       - run: cargo test --workspace
